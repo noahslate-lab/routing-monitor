@@ -30,8 +30,8 @@ _slack_client: Optional[AsyncWebClient] = None
 
 # Cache: CP userId → resolved display name (populated from CP user list)
 _cp_user_name_cache: Dict[str, str] = {}
-# Cache: CP userId → HubSpot owner ID (for meeting owner verification)
-_cp_user_hs_owner_cache: Dict[str, str] = {}
+# Cache: CP userId → email (for meeting owner verification by email)
+_cp_user_email_cache: Dict[str, str] = {}
 _cp_user_cache_loaded: bool = False
 
 
@@ -44,7 +44,7 @@ def _get_slack_client() -> Optional[AsyncWebClient]:
 
 async def _ensure_cp_user_cache():
     """Load all CP users into the name and HS owner caches on first use."""
-    global _cp_user_name_cache, _cp_user_hs_owner_cache, _cp_user_cache_loaded
+    global _cp_user_name_cache, _cp_user_email_cache, _cp_user_cache_loaded
     if _cp_user_cache_loaded:
         return
 
@@ -52,17 +52,16 @@ async def _ensure_cp_user_cache():
     for user in users:
         user_id = user.get("id", "")
         name = user.get("name", "")
+        email = user.get("email", "")
         if user_id and name:
             _cp_user_name_cache[user_id] = name
-        # Map CP userId → HubSpot owner ID for meeting verification
-        hs_info = user.get("hubspot", {})
-        if user_id and isinstance(hs_info, dict) and hs_info.get("id"):
-            _cp_user_hs_owner_cache[user_id] = str(hs_info["id"])
+        if user_id and email:
+            _cp_user_email_cache[user_id] = email.lower()
     _cp_user_cache_loaded = True
     print(
         f"[ROUTING_MONITOR] CP user cache loaded: "
         f"{len(_cp_user_name_cache)} names, "
-        f"{len(_cp_user_hs_owner_cache)} HS owner mappings"
+        f"{len(_cp_user_email_cache)} emails"
     )
 
 
@@ -532,7 +531,7 @@ async def _check_meeting_created(
     if assignments and isinstance(assignments[0], dict):
         cp_user_id = assignments[0].get("userId", "")
     cp_rep_name = _cp_user_name_cache.get(cp_user_id, cp_user_id)
-    expected_hs_owner_id = _cp_user_hs_owner_cache.get(cp_user_id, "")
+    cp_rep_email = _cp_user_email_cache.get(cp_user_id, "")
 
     if not meetings:
         return RoutingAlert(
@@ -549,39 +548,39 @@ async def _check_meeting_created(
             ),
         )
 
-    # Meeting exists — verify it's with the right rep
-    if expected_hs_owner_id:
-        meeting = meetings[0]  # Most recent meeting
-        meeting_props = meeting.get("properties", {})
-        meeting_owner_id = meeting_props.get("hubspot_owner_id", "")
-        meeting_title = meeting_props.get("hs_meeting_title", "")
-        meeting_start = meeting_props.get("hs_meeting_start_time", "")
+    # Meeting exists — verify it's with the right rep (compare by email,
+    # since CP↔HubSpot owner ID mappings can be stale/wrong)
+    meeting = meetings[0]  # Most recent meeting
+    meeting_props = meeting.get("properties", {})
+    meeting_owner_id = meeting_props.get("hubspot_owner_id", "")
+    meeting_title = meeting_props.get("hs_meeting_title", "")
+    meeting_start = meeting_props.get("hs_meeting_start_time", "")
 
-        if meeting_owner_id and meeting_owner_id != expected_hs_owner_id:
-            # Resolve actual meeting owner name
-            actual_owner = await hubspot_service.get_owner(meeting_owner_id)
-            actual_name = ""
-            if actual_owner:
-                actual_name = (
-                    f"{actual_owner.get('firstName', '')} "
-                    f"{actual_owner.get('lastName', '')}".strip()
-                    or actual_owner.get("email", "")
-                )
-
-            return RoutingAlert(
-                severity=AlertSeverity.WARNING,
-                title="Meeting Owner Mismatch",
-                details=(
-                    f"Chili Piper assigned this lead to *{cp_rep_name}*, "
-                    f"but the HubSpot meeting is owned by "
-                    f"*{actual_name or meeting_owner_id}*.\n"
-                    f"*Meeting:* {meeting_title}\n"
-                    f"*Scheduled:* {meeting_start}\n"
-                    f"The meeting may have been reassigned, or ownership "
-                    f"sync failed.\n"
-                    f"<{link}|View Contact in HubSpot>"
-                ),
+    if meeting_owner_id and cp_rep_email:
+        actual_owner = await hubspot_service.get_owner(meeting_owner_id)
+        if actual_owner:
+            actual_email = (actual_owner.get("email") or "").lower()
+            actual_name = (
+                f"{actual_owner.get('firstName', '')} "
+                f"{actual_owner.get('lastName', '')}".strip()
+                or actual_email
             )
+
+            # Compare by email — the only reliable shared key
+            if actual_email and actual_email != cp_rep_email:
+                return RoutingAlert(
+                    severity=AlertSeverity.WARNING,
+                    title="Meeting Owner Mismatch",
+                    details=(
+                        f"Chili Piper assigned this lead to *{cp_rep_name}* "
+                        f"(`{cp_rep_email}`), but the HubSpot meeting is "
+                        f"owned by *{actual_name}* (`{actual_email}`).\n"
+                        f"*Meeting:* {meeting_title}\n"
+                        f"*Scheduled:* {meeting_start}\n"
+                        f"The meeting may have been reassigned after routing.\n"
+                        f"<{link}|View Contact in HubSpot>"
+                    ),
+                )
 
     return None
 
