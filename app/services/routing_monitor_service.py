@@ -28,8 +28,9 @@ from app.services.hubspot_service import hubspot_service
 
 _slack_client: Optional[AsyncWebClient] = None
 
-# Cache: CP userId → resolved display name
+# Cache: CP userId → resolved display name (populated from CP user list)
 _cp_user_name_cache: Dict[str, str] = {}
+_cp_user_cache_loaded: bool = False
 
 
 def _get_slack_client() -> Optional[AsyncWebClient]:
@@ -37,6 +38,22 @@ def _get_slack_client() -> Optional[AsyncWebClient]:
     if _slack_client is None and settings.slack_bot_token:
         _slack_client = AsyncWebClient(token=settings.slack_bot_token)
     return _slack_client
+
+
+async def _ensure_cp_user_cache():
+    """Load all CP users into the name cache on first use."""
+    global _cp_user_name_cache, _cp_user_cache_loaded
+    if _cp_user_cache_loaded:
+        return
+
+    users = await chilipiper_service.list_all_users()
+    for user in users:
+        user_id = user.get("id", "")
+        name = user.get("name", "")
+        if user_id and name:
+            _cp_user_name_cache[user_id] = name
+    _cp_user_cache_loaded = True
+    print(f"[ROUTING_MONITOR] CP user cache loaded: {len(_cp_user_name_cache)} users")
 
 
 # ── Alert types ───────────────────────────────────────────────────────
@@ -264,40 +281,19 @@ def _cp_ownership_action_succeeded(log_entry: Dict[str, Any]) -> Optional[str]:
 
 
 async def _resolve_assigned_rep_name(
-    lead_email: str,
     cp_user_id: str = "",
 ) -> str:
     """
-    Resolve the assigned rep's name by looking at the HubSpot contact's
-    current owner. CP sets ownership via its action, so after a successful
-    routing the HS owner IS who CP assigned.
-
-    Also maintains a cache so that failed-action events (where HS owner
-    was never set) can still show the rep's name if we've seen them before.
+    Resolve the assigned rep's name from the CP user cache.
+    The cache is populated on first use from CP's user list API,
+    which maps userId → display name directly.
     """
-    # Check cache first
+    await _ensure_cp_user_cache()
+
     if cp_user_id and cp_user_id in _cp_user_name_cache:
         return _cp_user_name_cache[cp_user_id]
 
-    if not lead_email or not settings.hubspot_api_key:
-        return ""
-    contact = await hubspot_service.get_contact_by_email(lead_email)
-    if not contact:
-        return ""
-    hs_owner_id = contact.get("properties", {}).get("hubspot_owner_id")
-    if not hs_owner_id:
-        return ""
-    owner = await hubspot_service.get_owner(hs_owner_id)
-    if not owner:
-        return ""
-    name = (
-        f"{owner.get('firstName', '')} {owner.get('lastName', '')}".strip()
-        or owner.get("email", "")
-    )
-    # Cache for future lookups
-    if cp_user_id and name:
-        _cp_user_name_cache[cp_user_id] = name
-    return name
+    return ""
 
 
 async def _check_hubspot_ownership_sync(
@@ -459,16 +455,50 @@ async def _check_ownership_flipflop(
     return None
 
 
+def _meeting_was_booked(log_entry: Dict[str, Any]) -> bool:
+    """
+    Check if Chili Piper confirms a meeting was actually booked.
+    Returns True only when the lead completed the booking flow:
+    - meetingId is present in the log, OR
+    - MeetingOfferedLog action has MeetingOfferScheduledLogResult
+
+    Returns False for timeouts (lead didn't book) or when no meeting
+    offer was part of the routing flow.
+    """
+    # Direct signal: CP recorded a meeting ID
+    if log_entry.get("meetingId"):
+        return True
+
+    # Check the MeetingOfferedLog action result
+    for action in log_entry.get("actionsV2", []):
+        if action.get("type") == "MeetingOfferedLog":
+            result = action.get("result", {})
+            result_type = result.get("type", "") if isinstance(result, dict) else ""
+            if result_type == "MeetingOfferScheduledLogResult":
+                return True
+            # Explicit timeout or other non-scheduled result = not booked
+            return False
+
+    # No MeetingOfferedLog action at all = no meeting flow
+    return False
+
+
 async def _check_meeting_created(
     lead_email: str,
     routing_timestamp: str,
+    log_entry: Dict[str, Any],
 ) -> Optional[RoutingAlert]:
     """
-    After CP routes a lead, verify a meeting engagement was
-    created on the HubSpot contact. If not, the integration
-    may have silently failed.
+    After CP routes a lead AND confirms a meeting was booked,
+    verify a meeting engagement was created on the HubSpot contact.
+    Only alerts when CP says a meeting was booked but HubSpot
+    doesn't have it — skips timeouts and non-booking flows.
     """
     if not lead_email or not settings.hubspot_api_key:
+        return None
+
+    # Only check if CP confirms a meeting was actually booked
+    if not _meeting_was_booked(log_entry):
         return None
 
     contact = await hubspot_service.get_contact_by_email(lead_email)
@@ -486,10 +516,11 @@ async def _check_meeting_created(
             severity=AlertSeverity.WARNING,
             title="No Meeting Created in HubSpot",
             details=(
-                f"Chili Piper routed this lead but no meeting engagement "
-                f"was found on the HubSpot contact after `{routing_timestamp}`.\n"
-                f"The meeting creation action may have failed, or the "
-                f"booking wasn't completed.\n"
+                f"Chili Piper confirmed a meeting was booked (meetingId: "
+                f"`{log_entry.get('meetingId', 'N/A')}`) but no meeting "
+                f"engagement was found on the HubSpot contact after "
+                f"`{routing_timestamp}`.\n"
+                f"The HubSpot engagement creation likely failed.\n"
                 f"<{link}|View Contact in HubSpot>"
             ),
         )
@@ -513,7 +544,11 @@ async def analyze_routing_event(log_entry: Dict[str, Any]) -> List[RoutingAlert]
     lead_name = (
         f"{form_values.get('firstname', '')} {form_values.get('lastname', '')}"
     ).strip() or lead_email
-    lead_company = form_values.get("company", "")
+    lead_company = (
+        form_values.get("company", "")
+        or log_entry.get("accountName", "")
+        or ""
+    )
     router_name = log_entry.get("routerName", "")
     timestamp = log_entry.get("triggeredAt", "")
     crm_url = log_entry.get("guestCrmUrl", "")
@@ -524,21 +559,30 @@ async def analyze_routing_event(log_entry: Dict[str, Any]) -> List[RoutingAlert]
     if assignments and isinstance(assignments[0], dict):
         cp_user_id = assignments[0].get("userId", "")
 
-    # Resolve the assigned rep name from HubSpot (CP only gives us an internal userId)
-    assigned_rep_name = ""
-    if settings.hubspot_api_key and lead_email:
-        assigned_rep_name = await _resolve_assigned_rep_name(lead_email, cp_user_id)
-    # Fallback to CP userId if HubSpot resolution fails
+    # Resolve the assigned rep name from CP user cache
+    assigned_rep_name = await _resolve_assigned_rep_name(cp_user_id)
+    # Fallback to CP userId if cache miss
     if not assigned_rep_name:
         assigned_rep_name = cp_user_id
 
-    # Extract matched rule info
+    # Extract matched rule info — prefer name over type
     matched_rule_name = ""
     matched_path = log_entry.get("matchedPath", {})
     if isinstance(matched_path, dict):
         route = matched_path.get("route", {})
         if isinstance(route, dict):
-            matched_rule_name = route.get("ruleType", "")
+            matched_rule_name = (
+                route.get("name", "")
+                or route.get("ruleType", "")
+            )
+    # Also show assignment type (Ownership, StrictRoundRobin, etc.)
+    if assignments and isinstance(assignments[0], dict):
+        assign_type = assignments[0].get("type", "")
+        if assign_type and assign_type != matched_rule_name:
+            if matched_rule_name:
+                matched_rule_name = f"{matched_rule_name} ({assign_type})"
+            else:
+                matched_rule_name = assign_type
 
     # Run CP-data checks
     checks: List[Optional[RoutingAlert]] = [
@@ -553,7 +597,7 @@ async def analyze_routing_event(log_entry: Dict[str, Any]) -> List[RoutingAlert]
         hs_checks = await asyncio.gather(
             _check_hubspot_ownership_sync(lead_email, assigned_rep_name, log_entry),
             _check_ownership_flipflop(lead_email),
-            _check_meeting_created(lead_email, timestamp),
+            _check_meeting_created(lead_email, timestamp, log_entry),
             return_exceptions=True,
         )
         for result in hs_checks:
@@ -807,12 +851,8 @@ async def poll_and_analyze(
         for a in all_alerts
     ]
 
-    # 5. Post summary if there were events but no critical/warnings
-    critical_or_warning = [
-        a for a in all_alerts
-        if a.severity in (AlertSeverity.CRITICAL, AlertSeverity.WARNING)
-    ]
-    if stats["total_events"] > 0 and not critical_or_warning:
+    # 5. Always post a summary when there were events
+    if stats["total_events"] > 0:
         await post_summary(
             all_alerts,
             start.strftime("%Y-%m-%d %H:%M UTC"),

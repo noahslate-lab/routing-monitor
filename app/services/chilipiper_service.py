@@ -188,6 +188,44 @@ class ChiliPiperService:
             print(f"[CHILIPIPER] find_user failed: {e}")
             return []
 
+    async def list_all_users(self) -> List[Dict[str, Any]]:
+        """
+        Fetch all CP users by paginating through the find endpoint.
+        Uses the org's email domain to get all users.
+        """
+        all_users: List[Dict[str, Any]] = []
+        page = 0
+        page_size = 50
+        try:
+            # First page to get total
+            resp = await self.client.get(
+                "/v1/org/user/find",
+                params={"query": "", "page": page, "pageSize": page_size},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            total = data.get("total", 0)
+            all_users.extend(data.get("results", []))
+
+            # Fetch remaining pages
+            while len(all_users) < total:
+                page += 1
+                resp = await self.client.get(
+                    "/v1/org/user/find",
+                    params={"query": "", "page": page, "pageSize": page_size},
+                )
+                resp.raise_for_status()
+                results = resp.json().get("results", [])
+                if not results:
+                    break
+                all_users.extend(results)
+
+            print(f"[CHILIPIPER] Loaded {len(all_users)} users for name cache")
+            return all_users
+        except Exception as e:
+            print(f"[CHILIPIPER] list_all_users failed: {e}")
+            return all_users
+
     # ── Distributions ─────────────────────────────────────────────────
 
     async def list_distributions(
