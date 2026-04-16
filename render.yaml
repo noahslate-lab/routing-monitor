@@ -21,5 +21,5 @@ services:
       - key: SLACK_ROUTING_MONITOR_CHANNEL
         value: routing-monitor
       - key: ROUTING_MONITOR_INTERVAL_MINUTES
-        value: "30"
+        value: "10"
     healthCheckPath: /health
