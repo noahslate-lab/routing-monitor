@@ -1,0 +1,25 @@
+# Render Blueprint for Routing Monitor
+services:
+  - type: web
+    name: routing-monitor
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: CHILI_PIPER_API_KEY
+        sync: false
+      - key: CHILI_PIPER_BASE_URL
+        value: https://fire.chilipiper.com/api/fire-edge
+      - key: HUBSPOT_API_KEY
+        sync: false
+      - key: HUBSPOT_PORTAL_ID
+        value: "21261434"
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_ROUTING_MONITOR_CHANNEL
+        value: routing-monitor
+      - key: ROUTING_MONITOR_INTERVAL_MINUTES
+        value: "10"
+    healthCheckPath: /health
