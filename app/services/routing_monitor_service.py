@@ -121,13 +121,44 @@ def _extract_form_values(log_entry: Dict[str, Any]) -> Dict[str, str]:
     return flat
 
 
-# Known segment → employee-count ranges (adjust to match your real buckets)
-SEGMENT_EMPLOYEE_RANGES = {
-    "Commercial": (1, 79),
-    "SMB": (1, 49),
-    "Mid-Market - Low Employee Count": (80, 249),
-    "Mid-Market - High Employee Count": (250, 999),
-    "Enterprise": (1000, None),  # None = no upper bound
+# ── Segment classification ────────────────────────────────────────────
+#
+# Segment criteria (SDR count = number of SDRs at the company):
+#   Enterprise:  ≥1,000 employees AND ≥16 SDRs
+#   Mid-Market:  80–999 employees OR (≥1,000 employees with <16 SDRs)
+#   Commercial:  1–79 employees
+#
+# Clay enrichment handles the SDR nuance for inbound forms, but form
+# submissions may not always have SDR data — so we flag mismatches on
+# employee count and note when SDR data is missing.
+
+
+def _classify_segment(emp_count: int, sdr_count: Optional[int] = None) -> str:
+    """Determine the correct segment based on employee + SDR count."""
+    if emp_count < 1:
+        return "Unknown"
+    if emp_count <= 79:
+        return "Commercial"
+    if emp_count <= 999:
+        return "Mid-Market"
+    # ≥1,000 employees — need SDR count to distinguish
+    if sdr_count is not None and sdr_count >= 16:
+        return "Enterprise"
+    if sdr_count is not None:
+        return "Mid-Market"  # ≥1,000 but <16 SDRs
+    # No SDR data — could be either
+    return "Enterprise or Mid-Market"
+
+
+# Map form segment labels to our canonical names for comparison
+SEGMENT_ALIASES = {
+    "commercial": "Commercial",
+    "smb": "Commercial",
+    "mid-market": "Mid-Market",
+    "mid-market - low employee count": "Mid-Market",
+    "mid-market - high employee count": "Mid-Market",
+    "midmarket": "Mid-Market",
+    "enterprise": "Enterprise",
 }
 
 
@@ -136,11 +167,18 @@ SEGMENT_EMPLOYEE_RANGES = {
 def _check_segment_mismatch(
     form_values: Dict[str, str],
 ) -> Optional[RoutingAlert]:
-    """Flag when the segment field doesn't match actual employee count."""
-    segment = form_values.get("employee_size__segments_", "")
-    emp_count_raw = form_values.get("numberofemployees") or form_values.get("number_of_employees")
+    """
+    Flag when the routed segment doesn't match the actual company data.
+    Uses employee count + SDR count (when available) to determine
+    what the correct segment should be.
+    """
+    segment_raw = form_values.get("employee_size__segments_", "")
+    emp_count_raw = (
+        form_values.get("numberofemployees")
+        or form_values.get("number_of_employees")
+    )
 
-    if not segment or not emp_count_raw:
+    if not segment_raw or not emp_count_raw:
         return None
 
     try:
@@ -148,19 +186,61 @@ def _check_segment_mismatch(
     except (ValueError, TypeError):
         return None
 
-    expected = SEGMENT_EMPLOYEE_RANGES.get(segment)
-    if expected is None:
+    # Try to get SDR count from form data
+    sdr_count = None
+    sdr_raw = (
+        form_values.get("sdr_count")
+        or form_values.get("num_sdrs")
+        or form_values.get("number_of_sdrs")
+        or form_values.get("sdrcount")
+    )
+    if sdr_raw:
+        try:
+            sdr_count = int(sdr_raw)
+        except (ValueError, TypeError):
+            pass
+
+    # Normalize the form segment to our canonical names
+    form_segment = SEGMENT_ALIASES.get(segment_raw.lower().strip())
+    if not form_segment:
+        # Unknown segment label — can't compare
         return None
 
-    lo, hi = expected
-    if emp_count < lo or (hi is not None and emp_count > hi):
+    correct_segment = _classify_segment(emp_count, sdr_count)
+
+    # If we can't determine definitively (no SDR data for 1000+), be lenient
+    if correct_segment == "Enterprise or Mid-Market":
+        if form_segment in ("Enterprise", "Mid-Market"):
+            return None  # Either could be right without SDR data
+        # But if they said Commercial, that's definitely wrong
+        if form_segment == "Commercial":
+            return RoutingAlert(
+                severity=AlertSeverity.WARNING,
+                title="Segment Mismatch",
+                details=(
+                    f"Routed as *{segment_raw}* but company has "
+                    f"*{emp_count} employees* — should be Enterprise or "
+                    f"Mid-Market (SDR count not available to determine which).\n"
+                    f"Check Clay enrichment or form dropdown."
+                ),
+            )
+        return None
+
+    if form_segment != correct_segment:
+        sdr_note = ""
+        if sdr_count is not None:
+            sdr_note = f" with *{sdr_count} SDRs*"
+        elif emp_count >= 1000:
+            sdr_note = " (SDR count not available — check Clay enrichment)"
+
         return RoutingAlert(
             severity=AlertSeverity.WARNING,
             title="Segment Mismatch",
             details=(
-                f"Form/enrichment says *{segment}* but actual employee "
-                f"count is *{emp_count}*. Expected range: {lo}–{hi or '∞'}.\n"
-                f"This is likely a Clay enrichment or form dropdown issue."
+                f"Routed as *{segment_raw}* but should be "
+                f"*{correct_segment}* based on *{emp_count} employees*"
+                f"{sdr_note}.\n"
+                f"This lead was sent to the wrong team."
             ),
         )
     return None
