@@ -30,6 +30,8 @@ _slack_client: Optional[AsyncWebClient] = None
 
 # Cache: CP userId → resolved display name (populated from CP user list)
 _cp_user_name_cache: Dict[str, str] = {}
+# Cache: CP userId → HubSpot owner ID (for meeting owner verification)
+_cp_user_hs_owner_cache: Dict[str, str] = {}
 _cp_user_cache_loaded: bool = False
 
 
@@ -41,8 +43,8 @@ def _get_slack_client() -> Optional[AsyncWebClient]:
 
 
 async def _ensure_cp_user_cache():
-    """Load all CP users into the name cache on first use."""
-    global _cp_user_name_cache, _cp_user_cache_loaded
+    """Load all CP users into the name and HS owner caches on first use."""
+    global _cp_user_name_cache, _cp_user_hs_owner_cache, _cp_user_cache_loaded
     if _cp_user_cache_loaded:
         return
 
@@ -52,8 +54,16 @@ async def _ensure_cp_user_cache():
         name = user.get("name", "")
         if user_id and name:
             _cp_user_name_cache[user_id] = name
+        # Map CP userId → HubSpot owner ID for meeting verification
+        hs_info = user.get("hubspot", {})
+        if user_id and isinstance(hs_info, dict) and hs_info.get("id"):
+            _cp_user_hs_owner_cache[user_id] = str(hs_info["id"])
     _cp_user_cache_loaded = True
-    print(f"[ROUTING_MONITOR] CP user cache loaded: {len(_cp_user_name_cache)} users")
+    print(
+        f"[ROUTING_MONITOR] CP user cache loaded: "
+        f"{len(_cp_user_name_cache)} names, "
+        f"{len(_cp_user_hs_owner_cache)} HS owner mappings"
+    )
 
 
 # ── Alert types ───────────────────────────────────────────────────────
@@ -489,10 +499,12 @@ async def _check_meeting_created(
     log_entry: Dict[str, Any],
 ) -> Optional[RoutingAlert]:
     """
-    After CP routes a lead AND confirms a meeting was booked,
-    verify a meeting engagement was created on the HubSpot contact.
-    Only alerts when CP says a meeting was booked but HubSpot
-    doesn't have it — skips timeouts and non-booking flows.
+    After CP routes a lead AND confirms a meeting was booked:
+    1. Verify a meeting engagement exists on the HubSpot contact
+    2. Verify the meeting is owned by the rep CP assigned
+
+    Only runs when CP confirms a booking (meetingId or ScheduledLogResult).
+    Skips timeouts and non-booking flows entirely.
     """
     if not lead_email or not settings.hubspot_api_key:
         return None
@@ -501,29 +513,76 @@ async def _check_meeting_created(
     if not _meeting_was_booked(log_entry):
         return None
 
+    await _ensure_cp_user_cache()
+
     contact = await hubspot_service.get_contact_by_email(lead_email)
     if not contact:
         return None
 
     contact_id = contact.get("id", "")
+    link = hubspot_service.contact_link(contact_id)
+
     meetings = await hubspot_service.get_contact_meetings(
         contact_id, after_timestamp=routing_timestamp
     )
 
+    # Who did CP assign?
+    cp_user_id = ""
+    assignments = log_entry.get("assignments", [])
+    if assignments and isinstance(assignments[0], dict):
+        cp_user_id = assignments[0].get("userId", "")
+    cp_rep_name = _cp_user_name_cache.get(cp_user_id, cp_user_id)
+    expected_hs_owner_id = _cp_user_hs_owner_cache.get(cp_user_id, "")
+
     if not meetings:
-        link = hubspot_service.contact_link(contact_id)
         return RoutingAlert(
-            severity=AlertSeverity.WARNING,
+            severity=AlertSeverity.CRITICAL,
             title="No Meeting Created in HubSpot",
             details=(
-                f"Chili Piper confirmed a meeting was booked (meetingId: "
+                f"Chili Piper confirmed a meeting was booked with "
+                f"*{cp_rep_name}* (meetingId: "
                 f"`{log_entry.get('meetingId', 'N/A')}`) but no meeting "
-                f"engagement was found on the HubSpot contact after "
-                f"`{routing_timestamp}`.\n"
-                f"The HubSpot engagement creation likely failed.\n"
+                f"engagement was found on the HubSpot contact.\n"
+                f"The HubSpot engagement creation likely failed — "
+                f"the rep may not know about this meeting.\n"
                 f"<{link}|View Contact in HubSpot>"
             ),
         )
+
+    # Meeting exists — verify it's with the right rep
+    if expected_hs_owner_id:
+        meeting = meetings[0]  # Most recent meeting
+        meeting_props = meeting.get("properties", {})
+        meeting_owner_id = meeting_props.get("hubspot_owner_id", "")
+        meeting_title = meeting_props.get("hs_meeting_title", "")
+        meeting_start = meeting_props.get("hs_meeting_start_time", "")
+
+        if meeting_owner_id and meeting_owner_id != expected_hs_owner_id:
+            # Resolve actual meeting owner name
+            actual_owner = await hubspot_service.get_owner(meeting_owner_id)
+            actual_name = ""
+            if actual_owner:
+                actual_name = (
+                    f"{actual_owner.get('firstName', '')} "
+                    f"{actual_owner.get('lastName', '')}".strip()
+                    or actual_owner.get("email", "")
+                )
+
+            return RoutingAlert(
+                severity=AlertSeverity.WARNING,
+                title="Meeting Owner Mismatch",
+                details=(
+                    f"Chili Piper assigned this lead to *{cp_rep_name}*, "
+                    f"but the HubSpot meeting is owned by "
+                    f"*{actual_name or meeting_owner_id}*.\n"
+                    f"*Meeting:* {meeting_title}\n"
+                    f"*Scheduled:* {meeting_start}\n"
+                    f"The meeting may have been reassigned, or ownership "
+                    f"sync failed.\n"
+                    f"<{link}|View Contact in HubSpot>"
+                ),
+            )
+
     return None
 
 
