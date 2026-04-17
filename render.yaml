@@ -19,7 +19,7 @@ services:
       - key: SLACK_BOT_TOKEN
         sync: false
       - key: SLACK_ROUTING_MONITOR_CHANNEL
-        value: routing-monitor
+        value: C0AT5M22EUA
       - key: ROUTING_MONITOR_INTERVAL_MINUTES
         value: "10"
     healthCheckPath: /health
