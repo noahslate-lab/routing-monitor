@@ -584,9 +584,23 @@ async def _check_meeting_created(
 
     Only runs when CP confirms a booking (meetingId or ScheduledLogResult).
     Skips timeouts and non-booking flows entirely.
+
+    Waits at least 5 minutes after routing before checking, since
+    HubSpot engagement creation is async and can take a few minutes.
     """
     if not lead_email or not settings.hubspot_api_key:
         return None
+
+    # Don't check meetings that were routed less than 5 minutes ago —
+    # HubSpot engagement creation is async and needs time to sync
+    try:
+        routed_at = datetime.fromisoformat(
+            routing_timestamp.replace("Z", "+00:00")
+        )
+        if (datetime.now(timezone.utc) - routed_at).total_seconds() < 300:
+            return None
+    except (ValueError, TypeError):
+        pass
 
     # Only check if CP confirms a meeting was actually booked
     if not _meeting_was_booked(log_entry):
