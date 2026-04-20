@@ -322,6 +322,12 @@ class HubSpotService:
                     ticket_id = ticket.get("id")
                     print(f"[HUBSPOT] Created RevOps ticket #{ticket_id}: \"{subject[:60]}\"")
 
+                    # Create a note on the ticket with the full description
+                    if ticket_id:
+                        await self._create_ticket_note(
+                            ticket_id, subject, description, owner_id
+                        )
+
                     # Associate with contact if we have their email
                     if lead_email and ticket_id:
                         await self._associate_ticket_with_contact(ticket_id, lead_email)
@@ -336,6 +342,72 @@ class HubSpotService:
         except Exception as e:
             print(f"[HUBSPOT] create_routing_ticket error: {e}")
             return None
+
+    async def _create_ticket_note(
+        self,
+        ticket_id: str,
+        subject: str,
+        description: str,
+        owner_id: Optional[str] = None,
+    ) -> None:
+        """Create a note on the ticket so the description appears in the conversation timeline."""
+        # Convert plain text description to HTML
+        html_lines = []
+        html_lines.append(f"<h3>{subject}</h3>")
+        for line in description.split("\n"):
+            if not line.strip():
+                html_lines.append("<br/>")
+            elif line.startswith("•"):
+                html_lines.append(f"<p>{line}</p>")
+            elif ": " in line and not line.startswith("http"):
+                # Field lines like "Lead Email: foo@bar.com"
+                key, _, val = line.partition(": ")
+                html_lines.append(f"<p><strong>{key}:</strong> {val}</p>")
+            elif line.startswith("http"):
+                html_lines.append(f'<p><a href="{line}">{line}</a></p>')
+            else:
+                html_lines.append(f"<p>{line}</p>")
+
+        html_body = "\n".join(html_lines)
+
+        properties = {
+            "hs_note_body": html_body,
+            "hs_timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if owner_id:
+            properties["hubspot_owner_id"] = owner_id
+
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"{self.base_url}/crm/v3/objects/notes",
+                    headers=self._headers,
+                    json={
+                        "properties": properties,
+                        "associations": [
+                            {
+                                "to": {"id": ticket_id},
+                                "types": [
+                                    {
+                                        "associationCategory": "HUBSPOT_DEFINED",
+                                        "associationTypeId": 18,
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    timeout=15,
+                )
+                if resp.status_code in (200, 201):
+                    note_id = resp.json().get("id")
+                    print(f"[HUBSPOT] Note {note_id} created on ticket #{ticket_id}")
+                else:
+                    print(
+                        f"[HUBSPOT] Note creation failed: "
+                        f"{resp.status_code} {resp.text[:200]}"
+                    )
+        except Exception as e:
+            print(f"[HUBSPOT] _create_ticket_note error: {e}")
 
     async def _associate_ticket_with_contact(
         self, ticket_id: str, email: str
