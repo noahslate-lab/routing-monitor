@@ -856,7 +856,10 @@ def _build_summary_blocks(
     ]
 
 
-async def create_revops_ticket_for_alert(alert: RoutingAlert) -> Optional[str]:
+async def create_revops_ticket_for_alert(
+    alert: RoutingAlert,
+    slack_alert_ts: Optional[str] = None,
+) -> Optional[str]:
     """
     Create a RevOps Help Desk ticket for a critical routing alert.
     Returns the ticket ID if created, None otherwise.
@@ -903,6 +906,7 @@ async def create_revops_ticket_for_alert(alert: RoutingAlert) -> Optional[str]:
         description=description,
         priority="HIGH",
         lead_email=alert.lead_email,
+        slack_alert_ts=slack_alert_ts,
     )
 
     if ticket:
@@ -1075,7 +1079,7 @@ async def poll_and_analyze(
                 stats["alerts_posted"] += 1
 
         if alert.severity == AlertSeverity.CRITICAL:
-            ticket_id = await create_revops_ticket_for_alert(alert)
+            ticket_id = await create_revops_ticket_for_alert(alert, slack_alert_ts=alert_ts)
             if ticket_id:
                 stats.setdefault("tickets_created", 0)
                 stats["tickets_created"] += 1

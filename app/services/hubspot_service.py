@@ -278,12 +278,20 @@ class HubSpotService:
 
     # ── RevOps Help Desk ticket creation ────────────────────────────
 
+    SLACK_WORKSPACE_URL = "https://nooks-group.slack.com"
+
+    def _build_slack_thread_url(self, channel: str, ts: str) -> str:
+        """Build a clickable Slack thread URL from channel + message ts."""
+        fragment = ts.replace(".", "")
+        return f"{self.SLACK_WORKSPACE_URL}/archives/{channel}/p{fragment}"
+
     async def create_routing_ticket(
         self,
         subject: str,
         description: str,
         priority: str = "HIGH",
         lead_email: Optional[str] = None,
+        slack_alert_ts: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Create a ticket in the RevOps Requests Help Desk pipeline
@@ -308,6 +316,15 @@ class HubSpotService:
             "hs_ticket_priority": priority,
             "hubspot_owner_id": owner_id,
         }
+
+        # Set Slack thread properties so the ticket links back to the alert
+        if slack_alert_ts:
+            channel = settings.slack_routing_monitor_channel
+            properties["slack_thread_ts"] = slack_alert_ts
+            properties["slack_channel_id"] = channel
+            properties["slack_thread_url"] = self._build_slack_thread_url(
+                channel, slack_alert_ts
+            )
 
         try:
             async with httpx.AsyncClient() as client:
