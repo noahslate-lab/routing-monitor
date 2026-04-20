@@ -856,26 +856,105 @@ def _build_summary_blocks(
     ]
 
 
-async def post_routing_alert(alert: RoutingAlert) -> bool:
-    """Post a single routing alert to the routing monitor Slack channel."""
+async def create_revops_ticket_for_alert(alert: RoutingAlert) -> Optional[str]:
+    """
+    Create a RevOps Help Desk ticket for a critical routing alert.
+    Returns the ticket ID if created, None otherwise.
+    """
+    if not settings.revops_ticket_enabled or not settings.hubspot_api_key:
+        return None
+
+    subject = f"Routing Alert: {alert.title}"
+    if alert.lead_name and alert.lead_name != alert.lead_email:
+        subject += f" — {alert.lead_name}"
+    elif alert.lead_email:
+        subject += f" — {alert.lead_email}"
+
+    # Build a detailed description
+    lines = [alert.details, ""]
+    if alert.lead_email:
+        lines.append(f"Lead Email: {alert.lead_email}")
+    if alert.lead_company:
+        lines.append(f"Company: {alert.lead_company}")
+    if alert.assigned_rep:
+        lines.append(f"Assigned Rep: {alert.assigned_rep}")
+    if alert.router_name:
+        lines.append(f"Router: {alert.router_name}")
+    if alert.matched_rule:
+        lines.append(f"Matched Rule: {alert.matched_rule}")
+    if alert.timestamp:
+        lines.append(f"Routing Time: {alert.timestamp}")
+
+    # Add HubSpot contact link if we have the email
+    if alert.lead_email:
+        lines.append("")
+        lines.append(
+            f"HubSpot Contact: https://app.hubspot.com/contacts/"
+            f"{settings.hubspot_portal_id}/contact/?email={alert.lead_email}"
+        )
+
+    lines.append("")
+    lines.append("Source: Routing Monitor (automated)")
+
+    description = "\n".join(lines)
+
+    ticket = await hubspot_service.create_routing_ticket(
+        subject=subject,
+        description=description,
+        priority="HIGH",
+        lead_email=alert.lead_email,
+    )
+
+    if ticket:
+        ticket_id = ticket.get("id")
+        print(f"[ROUTING_MONITOR] RevOps ticket #{ticket_id} created for: {alert.title}")
+        return ticket_id
+
+    return None
+
+
+async def post_routing_alert(alert: RoutingAlert) -> Optional[str]:
+    """
+    Post a single routing alert to the routing monitor Slack channel.
+    Returns the Slack message timestamp (for threading replies) or None.
+    """
     client = _get_slack_client()
     channel = settings.slack_routing_monitor_channel
     if not client or not channel:
         print(f"[ROUTING_MONITOR] Slack not configured — alert: {alert.title}")
-        return False
+        return None
 
     blocks = _build_alert_blocks(alert)
     try:
-        await client.chat_postMessage(
+        result = await client.chat_postMessage(
             channel=channel,
             text=f"{SEVERITY_EMOJI.get(alert.severity, '')} Routing Alert: {alert.title} — {alert.lead_name}",
             blocks=blocks,
         )
         print(f"[ROUTING_MONITOR] Posted alert: {alert.title} for {alert.lead_name}")
-        return True
+        return result.get("ts")
     except SlackApiError as e:
         print(f"[ROUTING_MONITOR] Failed to post alert: {e}")
-        return False
+        return None
+
+
+async def post_ticket_link_reply(alert_ts: str, ticket_id: str) -> None:
+    """Reply to a routing alert Slack message with the HubSpot ticket link."""
+    client = _get_slack_client()
+    channel = settings.slack_routing_monitor_channel
+    if not client or not channel or not alert_ts:
+        return
+
+    hubspot_url = hubspot_service.ticket_link(ticket_id)
+    try:
+        await client.chat_postMessage(
+            channel=channel,
+            thread_ts=alert_ts,
+            text=f"📋 *RevOps Ticket Created:* <{hubspot_url}|#{ticket_id}>",
+        )
+        print(f"[ROUTING_MONITOR] Posted ticket link #{ticket_id} in thread {alert_ts}")
+    except SlackApiError as e:
+        print(f"[ROUTING_MONITOR] Failed to post ticket link reply: {e}")
 
 
 async def post_summary(
@@ -986,11 +1065,22 @@ async def poll_and_analyze(
             all_alerts.extend(alerts)
 
     # 4. Post alerts (critical and warning only — info is summary-only)
+    #    For critical alerts, also create a RevOps Help Desk ticket
+    #    and reply to the Slack alert with the ticket link
     for alert in all_alerts:
+        alert_ts = None
         if alert.severity in (AlertSeverity.CRITICAL, AlertSeverity.WARNING):
-            posted = await post_routing_alert(alert)
-            if posted:
+            alert_ts = await post_routing_alert(alert)
+            if alert_ts:
                 stats["alerts_posted"] += 1
+
+        if alert.severity == AlertSeverity.CRITICAL:
+            ticket_id = await create_revops_ticket_for_alert(alert)
+            if ticket_id:
+                stats.setdefault("tickets_created", 0)
+                stats["tickets_created"] += 1
+                if alert_ts:
+                    await post_ticket_link_reply(alert_ts, ticket_id)
 
     stats["alerts"] = [
         {

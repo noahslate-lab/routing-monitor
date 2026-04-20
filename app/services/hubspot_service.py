@@ -276,6 +276,107 @@ class HubSpotService:
             print(f"[HUBSPOT] get_company error: {e}")
             return None
 
+    # ── RevOps Help Desk ticket creation ────────────────────────────
+
+    async def create_routing_ticket(
+        self,
+        subject: str,
+        description: str,
+        priority: str = "HIGH",
+        lead_email: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Create a ticket in the RevOps Requests Help Desk pipeline
+        for a critical routing alert.
+        """
+        if not self.api_key:
+            return None
+
+        pipeline_id = settings.revops_ticket_pipeline_id
+        stage_id = settings.revops_ticket_stage_new
+        owner_id = settings.revops_ticket_default_owner_id
+
+        if not pipeline_id or not stage_id:
+            print("[HUBSPOT] RevOps ticket pipeline not configured, skipping")
+            return None
+
+        properties = {
+            "subject": subject[:200],
+            "content": description,
+            "hs_pipeline": pipeline_id,
+            "hs_pipeline_stage": stage_id,
+            "hs_ticket_priority": priority,
+            "hubspot_owner_id": owner_id,
+            "source_type": "AUTOMATION",
+        }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"{self.base_url}/crm/v3/objects/tickets",
+                    headers=self._headers,
+                    json={"properties": properties},
+                    timeout=15,
+                )
+                if resp.status_code in (200, 201):
+                    ticket = resp.json()
+                    ticket_id = ticket.get("id")
+                    print(f"[HUBSPOT] Created RevOps ticket #{ticket_id}: \"{subject[:60]}\"")
+
+                    # Associate with contact if we have their email
+                    if lead_email and ticket_id:
+                        await self._associate_ticket_with_contact(ticket_id, lead_email)
+
+                    return ticket
+                else:
+                    print(
+                        f"[HUBSPOT] RevOps ticket creation failed: "
+                        f"{resp.status_code} {resp.text[:200]}"
+                    )
+                    return None
+        except Exception as e:
+            print(f"[HUBSPOT] create_routing_ticket error: {e}")
+            return None
+
+    async def _associate_ticket_with_contact(
+        self, ticket_id: str, email: str
+    ) -> None:
+        """Look up a contact by email and associate with the ticket."""
+        try:
+            contact = await self.get_contact_by_email(email)
+            if not contact:
+                return
+
+            contact_id = contact.get("id")
+            if not contact_id:
+                return
+
+            async with httpx.AsyncClient() as client:
+                resp = await client.put(
+                    f"{self.base_url}/crm/v4/objects/tickets/{ticket_id}"
+                    f"/associations/contacts/{contact_id}",
+                    headers=self._headers,
+                    json=[
+                        {
+                            "associationCategory": "HUBSPOT_DEFINED",
+                            "associationTypeId": 16,
+                        }
+                    ],
+                    timeout=15,
+                )
+                if resp.status_code in (200, 201):
+                    print(
+                        f"[HUBSPOT] Associated ticket #{ticket_id} "
+                        f"with contact {contact_id} ({email})"
+                    )
+                else:
+                    print(
+                        f"[HUBSPOT] Ticket-contact association failed: "
+                        f"{resp.status_code}"
+                    )
+        except Exception as e:
+            print(f"[HUBSPOT] _associate_ticket_with_contact error: {e}")
+
     # ── Helpers ───────────────────────────────────────────────────────
 
     def contact_link(self, contact_id: str) -> str:
@@ -283,6 +384,9 @@ class HubSpotService:
 
     def company_link(self, company_id: str) -> str:
         return f"https://app.hubspot.com/contacts/{self.portal_id}/company/{company_id}"
+
+    def ticket_link(self, ticket_id: str) -> str:
+        return f"https://app.hubspot.com/contacts/{self.portal_id}/ticket/{ticket_id}"
 
 
 hubspot_service = HubSpotService()
