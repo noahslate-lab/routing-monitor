@@ -307,7 +307,6 @@ class HubSpotService:
             "hs_pipeline_stage": stage_id,
             "hs_ticket_priority": priority,
             "hubspot_owner_id": owner_id,
-            "source_type": "AUTOMATION",
         }
 
         try:
