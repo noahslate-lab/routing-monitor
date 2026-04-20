@@ -85,6 +85,7 @@ class RoutingAlert:
         lead_email: Optional[str] = None,
         lead_company: Optional[str] = None,
         assigned_rep: Optional[str] = None,
+        assigned_rep_email: Optional[str] = None,
         router_name: Optional[str] = None,
         matched_rule: Optional[str] = None,
         timestamp: Optional[str] = None,
@@ -97,6 +98,7 @@ class RoutingAlert:
         self.lead_email = lead_email
         self.lead_company = lead_company
         self.assigned_rep = assigned_rep
+        self.assigned_rep_email = assigned_rep_email
         self.router_name = router_name
         self.matched_rule = matched_rule
         self.timestamp = timestamp
@@ -711,11 +713,12 @@ async def analyze_routing_event(log_entry: Dict[str, Any]) -> List[RoutingAlert]
     if assignments and isinstance(assignments[0], dict):
         cp_user_id = assignments[0].get("userId", "")
 
-    # Resolve the assigned rep name from CP user cache
+    # Resolve the assigned rep name and email from CP user cache
     assigned_rep_name = await _resolve_assigned_rep_name(cp_user_id)
     # Fallback to CP userId if cache miss
     if not assigned_rep_name:
         assigned_rep_name = cp_user_id
+    assigned_rep_email = _cp_user_email_cache.get(cp_user_id, "")
 
     # Extract matched rule info — prefer name over type
     matched_rule_name = ""
@@ -764,6 +767,7 @@ async def analyze_routing_event(log_entry: Dict[str, Any]) -> List[RoutingAlert]
             alert.lead_email = alert.lead_email or lead_email
             alert.lead_company = alert.lead_company or lead_company
             alert.assigned_rep = alert.assigned_rep or assigned_rep_name
+            alert.assigned_rep_email = alert.assigned_rep_email or assigned_rep_email
             alert.router_name = alert.router_name or router_name
             alert.matched_rule = alert.matched_rule or matched_rule_name
             alert.timestamp = alert.timestamp or timestamp
@@ -907,6 +911,8 @@ async def create_revops_ticket_for_alert(
         priority="HIGH",
         lead_email=alert.lead_email,
         slack_alert_ts=slack_alert_ts,
+        requester_email=alert.assigned_rep_email,
+        requester_name=alert.assigned_rep,
     )
 
     if ticket:

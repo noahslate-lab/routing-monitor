@@ -292,6 +292,8 @@ class HubSpotService:
         priority: str = "HIGH",
         lead_email: Optional[str] = None,
         slack_alert_ts: Optional[str] = None,
+        requester_email: Optional[str] = None,
+        requester_name: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Create a ticket in the RevOps Requests Help Desk pipeline
@@ -325,6 +327,47 @@ class HubSpotService:
             properties["slack_thread_url"] = self._build_slack_thread_url(
                 channel, slack_alert_ts
             )
+
+        # Set requester to the rep Chili Piper originally routed to
+        if requester_email:
+            properties["requester_email"] = requester_email
+            # Look up their HubSpot owner ID for account_requester
+            # CP and HS emails may differ (e.g. tanaree.suriwong@ vs tanaree@)
+            # so try exact match first, then match by email domain username
+            owners = await self.list_owners()
+            req_lower = requester_email.lower()
+            req_domain = req_lower.split("@")[-1] if "@" in req_lower else ""
+            matched_owner_id = None
+
+            for owner in owners:
+                owner_email = owner.get("email", "").lower()
+                if owner_email == req_lower:
+                    matched_owner_id = owner["id"]
+                    break
+
+            # Fallback: match by same domain + first name in email
+            if not matched_owner_id and req_domain:
+                req_parts = req_lower.split("@")[0].replace(".", " ").split()
+                for owner in owners:
+                    owner_email = owner.get("email", "").lower()
+                    if not owner_email.endswith(f"@{req_domain}"):
+                        continue
+                    owner_parts = owner_email.split("@")[0].replace(".", " ").split()
+                    # Match if any name part overlaps (e.g. "tanaree" in both)
+                    if set(req_parts) & set(owner_parts):
+                        matched_owner_id = owner["id"]
+                        print(
+                            f"[HUBSPOT] Fuzzy email match: {requester_email} "
+                            f"→ {owner_email} (owner {owner['id']})"
+                        )
+                        break
+
+            if matched_owner_id:
+                properties["account_requester"] = matched_owner_id
+                print(
+                    f"[HUBSPOT] Requester: {requester_name or requester_email} "
+                    f"(owner {matched_owner_id})"
+                )
 
         try:
             async with httpx.AsyncClient() as client:
